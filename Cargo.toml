@@ -1,0 +1,20 @@
+[package]
+name = "axum-topo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7.7", features = ["http2", "macros", "ws"] }
+base32 = "0.5.1"
+chrono = { version = "0.4.23", features = ["serde"] }
+env_logger = "0.10.0"
+rand = "0.8.5"
+serde = { version = "1.0.152", features = ["derive"] }
+serde_json = "1.0.91"
+sqlx = { version = "0.8.2", features = ["postgres", "sqlite"] }
+tokio = { version = "1.40.0", features = ["full"] }
+totp-rs = { version = "5.5.1", features = ["qr","otpauth"] }
+tower = { version = "0.5.1", features = ["full"] }
+tower-http = { version = "0.6.1", features = ["full"] }
+uuid = { version = "1.2.2", features = ["v4"] }
+

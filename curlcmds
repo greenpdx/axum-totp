@@ -1,0 +1,3 @@
+curl --json '{"name": "test", "email": "test1@test.org", "password": "bob"}' http://10.0.42.170:3000/api/auth/register
+curl --json '{"email": "test1@test.org", "password": "bob"}' http://10.0.42.170:3000/api/auth/login
+curl --json '{"email": "test1@test.org", "user_id": "9c5886ce-0260-4be9-b760-ec4cd7f6caca"}' http://10.0.42.170:3000/api/auth/otp/generate
