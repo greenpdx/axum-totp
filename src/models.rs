@@ -46,13 +46,13 @@ pub struct UserRegisterSchema {
 #[derive(Debug, Deserialize)]
 pub struct UserLoginSchema {
     pub email: String,
-    pub _password: String,
+    pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateOTPSchema {
     pub email: String,
-    pub _user_id: String,
+    pub user_id: String,
 }
 
 #[derive(Debug, Deserialize)]
