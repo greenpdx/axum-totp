@@ -11,8 +11,8 @@ pub struct User {
     pub name: String,
     pub password: String,
 
-    pub otp_enabled: Option<bool>,
-    pub otp_verified: Option<bool>,
+    pub otp_enabled: bool,
+    pub otp_verified: bool,
     pub otp_base32: Option<String>,
     pub otp_auth_url: Option<String>,
 

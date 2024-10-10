@@ -86,14 +86,14 @@ async fn register(
         email: reg.email.to_owned().to_lowercase(),
         name: reg.name.to_owned(),
         password: reg.password.to_owned(),
-        otp_enabled: Some(false),
-        otp_verified: Some(false),
+        otp_enabled: false,
+        otp_verified: false,
         otp_base32: None,
         otp_auth_url: None,
         createdAt: Some(datetime),
         updatedAt: Some(datetime),
         role: 0,
-        sess: Some("test".to_string()),
+        sess: None,
     };
 
     println!("REG {:?} S=>{:?}",reg, user);
@@ -109,12 +109,13 @@ async fn login(
     State(state): State<AppState>,
     Json(reg): Json<UserLoginSchema>
 ) -> impl IntoResponse {
-    let usr = state.db.lock().unwrap();
+    let mut usr = state.db.lock().unwrap();
 
     let user = match usr
-        .iter()
-        .find(|&u| u.email == reg.email.to_lowercase()) {
+        .iter_mut()
+        .find(|u| u.email == reg.email.to_lowercase()) {
             Some(u) => {
+                // check password
                 u
             }
             None => {
@@ -127,6 +128,8 @@ async fn login(
                 return Json(json!(error_response))
             }
     };  
+
+    user.otp_verified = false;
 
     let json_response = UserResponse {
         status: "success".to_string(),
@@ -150,15 +153,22 @@ async fn generate(
         .iter_mut()
         .find(|u| u.email == gen.email.to_lowercase()) {
             Some(u) => {
+                if u.otp_enabled {
+                    println!("Already enabled");
+                    let error_response = GenericResponse {
+                        status: "fail".to_string(),
+                        message: format!("F2A already enabled"),
+                    };
+                    return Json(json!(error_response))
+                };
                 u
             }
             None => {
                 println!("Not Found");
                 let error_response = GenericResponse {
                     status: "fail".to_string(),
-                    message: format!("Invalid email or password"),
+                    message: format!("User Not Found"),
                 };
-                //return (StatusCode::NOT_FOUND, format!("User with email: {} already exists", error_response.message))
                 return Json(json!(error_response))
             }
     };
@@ -187,8 +197,10 @@ async fn generate(
     // let otp_auth_url = format!("otpauth://totp/<issuer>:<account_name>?secret=<secret>&issuer=<issuer>");
     user.otp_base32 = Some(otp_base32.to_owned());
     user.otp_auth_url = Some(otp_auth_url.to_owned());
+    user.otp_enabled = true;
+    user.otp_verified = false;
 
-    println!("GEN {:?}", &email);
+    println!("GEN {:?}", &user);
     Json(json!({"base32":otp_base32.to_owned(), "otpauth_url": otp_auth_url.to_owned()} ))
 
 }
@@ -204,6 +216,8 @@ async fn verify(
         .iter_mut()
         .find(|u| u.id == Some(verf.user_id.clone())) {
             Some(u) => {
+                let datetime = Utc::now();
+                u.updatedAt = Some(datetime);
                 u
             }
             None => {
@@ -242,8 +256,8 @@ async fn verify(
         return Json(json!(json_error))
     }
 
-    user.otp_enabled = Some(true);
-    user.otp_verified = Some(true);
+    user.otp_enabled = true;
+    user.otp_verified = true;
     println!("VERVAL");
     Json(json!({"otp_verified": true, "user": user_to_response(user)}))
 
@@ -273,7 +287,7 @@ async fn validate(
             }
     };
 
-    if !user.otp_enabled.unwrap() {
+    if !user.otp_enabled {
         let json_error = GenericResponse {
             status: "fail".to_string(),
             message: "2FA not enabled".to_string(),
@@ -329,8 +343,8 @@ async fn disable(
             }
     };
     println!("DISABLED");
-    user.otp_enabled = Some(false);
-    user.otp_verified = Some(false);
+    user.otp_enabled = false;
+    user.otp_verified = false;
     user.otp_auth_url = None;
     user.otp_base32 = None;
     
@@ -398,8 +412,8 @@ fn user_to_response(user: &User) -> UserData {
         email: user.email.to_owned(),
         otp_auth_url: user.otp_auth_url.to_owned(),
         otp_base32: user.otp_base32.to_owned(),
-        otp_enabled: user.otp_enabled.unwrap(),
-        otp_verified: user.otp_verified.unwrap(),
+        otp_enabled: user.otp_enabled,
+        otp_verified: user.otp_verified,
         createdAt: user.createdAt.unwrap(),
         updatedAt: user.updatedAt.unwrap(),
         sess: ses,
