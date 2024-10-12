@@ -1,7 +1,8 @@
 use chrono::prelude::*;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct GenericResponse {
     pub status: String,
     pub message: String,
@@ -9,6 +10,7 @@ pub struct GenericResponse {
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Debug)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct UserData {
     pub id: String,
     pub email: String,
@@ -26,7 +28,15 @@ pub struct UserData {
 }
 
 #[derive(Serialize, Debug)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct UserResponse {
     pub status: String,
     pub user: UserData,
+}
+
+#[derive(Serialize, Debug)]
+#[cfg_attr(test, derive(Deserialize))]
+pub struct GenerateResponse {
+    base32: String,
+    otpauth_url: String,
 }

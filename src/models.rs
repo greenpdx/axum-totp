@@ -36,7 +36,13 @@ impl AppState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ReqState {
+    pub test: String,
+}
+
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct UserRegisterSchema {
     pub name: String,
     pub email: String,
@@ -44,24 +50,28 @@ pub struct UserRegisterSchema {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct UserLoginSchema {
     pub email: String,
     pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct GenerateOTPSchema {
     pub email: String,
     pub user_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct VerifyOTPSchema {
     pub user_id: String,
     pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct DisableOTPSchema {
     pub user_id: String,
 }

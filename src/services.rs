@@ -12,7 +12,7 @@
 use crate::{
     models::{
         AppState, DisableOTPSchema, GenerateOTPSchema, User, UserLoginSchema, UserRegisterSchema,
-        VerifyOTPSchema,
+        VerifyOTPSchema, ReqState
     },
     response::{GenericResponse, UserData, UserResponse},
 };
@@ -22,11 +22,10 @@ use rand::Rng;
 use totp_rs::{Algorithm, Secret, TOTP};
 use uuid::Uuid;
 use axum::{
-    extract::{State, Json}, 
-    Router, routing::post,
-    response::IntoResponse,
+    extract::{Json, State}, response::IntoResponse, routing::post, Extension, Router
 };
 use serde_json::json;
+use std::sync::Arc;
 
 const ISSUER: &str = "CRmep";
 
@@ -58,6 +57,7 @@ pub fn auth_routes(state: AppState) -> Router {
 #[axum::debug_handler]
 async fn register(
     State(state): State<AppState>,
+    reqstate: Extension<Arc<ReqState>>,
     Json(reg): Json<UserRegisterSchema>
 
 ) -> impl IntoResponse {
@@ -99,7 +99,7 @@ async fn register(
     println!("REG {:?} S=>{:?}",reg, user);
     usr.push(user);
 
-    Json(json!({"data": 42}))
+    Json(json!({"status": "success", "message": "Registered successfully, please login"}))
 
 
 }
@@ -107,6 +107,7 @@ async fn register(
 #[axum::debug_handler]
 async fn login(
     State(state): State<AppState>,
+    reqstate: Extension<Arc<ReqState>>,
     Json(reg): Json<UserLoginSchema>
 ) -> impl IntoResponse {
     let mut usr = state.db.lock().unwrap();
@@ -433,3 +434,25 @@ pub fn config(conf: &mut web::ServiceConfig) {
 
     conf.service(scope);
 }*/
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    //use axum::response::
+
+    #[tokio::test]
+    async fn tst_register() {
+        let app_state = State(AppState::init());
+        let reg = UserRegisterSchema {
+            name: "test1 test".to_string(),
+            email: "test1@test.tst".to_string(),
+            password: "bob".to_string(),
+        };
+        let data = Json(reg);
+        let reqstate = Extension(Arc::new(ReqState { test: "bob".to_string()}));
+        let resp = register(app_state, reqstate, data).await;
+
+
+        //println!("RESP {:?}", resp.deref());
+    }
+}
