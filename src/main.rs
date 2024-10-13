@@ -43,15 +43,19 @@ async fn hello_world() -> &'static str {
 }
 
 async fn init_router(state: AppState, _cors: CorsLayer) -> Router {
-    let auth = auth_routes(state);
+    let auth = auth_routes();
+
     let reqstate = Arc::new(ReqState { test: "BOB".to_string()});
 
     Router::new()
-    .route("/", get(hello_world))
-    .nest("/auth", auth)
-    .layer(Extension(reqstate))
-    .layer(CorsLayer::permissive())
-    .layer(TraceLayer::new_for_http())
+        .route("/", get(hello_world))
+    
+        .nest("/auth", auth)
+    
+        .layer(Extension(reqstate))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 
 }
 
@@ -66,7 +70,11 @@ mod test {
         },
         response::{GenericResponse, UserData, UserResponse, GenerateResponse},
     };
+    use totp_rs::{Secret, TOTP, Algorithm};
+
     use serde::{Serialize, Deserialize};
+
+
 
     async fn setup(state: AppState) -> TestServer {
         let cors = CorsLayer::new()
@@ -125,7 +133,7 @@ mod test {
         let (_srv, _user) = impl_login().await;
     }
 
-    async fn impl_generate() -> (TestServer, UserData) {
+    async fn impl_generate() -> (TestServer, UserData, GenerateResponse) {
         let (server, user) = impl_login().await;
 
         let gen = GenerateOTPSchema {
@@ -138,12 +146,28 @@ mod test {
 
         let qr = resp.json::<GenerateResponse>();
         println!("GEN {:?}", qr);
-        (server, user)
+        (server, user, qr)
     }
 
     #[tokio::test]
     async fn generate() {
-        let (server, user) = impl_generate().await;
-        println!("{:?}", user);
+        let (server, user, qr) = impl_generate().await;
+        println!("{:?}", qr.base32);
+        let secret = Secret::Encoded(qr.base32);
+        let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret.to_bytes().unwrap(), Some("CRmep".to_string()), "CRmep".to_string()).unwrap();
+        let rslt = totp.generate(1000000);
+        println!("TOK {:?}", rslt);
+        assert_eq!(rslt, "430646");
+    }
+
+    async fn impl_verify() {
+        let (server, user, qr) = impl_generate().await;
+        println!("VERIFY {:?}", server);
+        
+    }
+
+    #[tokio::test]
+    async fn verify() {
+        impl_verify().await;
     }
 }

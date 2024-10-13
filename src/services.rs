@@ -29,26 +29,33 @@ use std::sync::Arc;
 
 const ISSUER: &str = "CRmep";
 
-fn otp_routes(state: AppState) -> Router {
+#[cfg(test)] 
+const TSTRAND: &str = "4473MRRARA7B2O6YQML3BHOOGCUAKXS3DY";
+
+
+//fn otp_routes(state: AppState) -> Router {
+fn otp_routes() -> Router<AppState> {
     let r = Router::new()
         .route("/generate", post(generate))
         .route("/verify", post(verify))
         .route("/validate", post(validate))
         .route("/disable", post(disable))
-        .with_state(state);
+        //.with_state(state)
+        ;
 
     r
 }
 
-pub fn auth_routes(state: AppState) -> Router {
+//pub fn auth_routes(state: AppState) -> Router {
+pub fn auth_routes() -> Router<AppState> {
     let r = Router::new()
     .route("/register", post(register))
     .route("/login", post(login))
     .route("/profile", post(profile))
     .route("/logout", post(logout))
-    .with_state(state.clone())
-    .nest("/otp", otp_routes(state));
-
+    //.with_state(state.clone())
+    //.nest("/otp", otp_routes(state));
+    .nest("/otp", otp_routes());
 
     r
 }
@@ -142,6 +149,8 @@ async fn login(
 }
 
 
+
+
 #[axum::debug_handler]
 async fn generate(
     State(state): State<AppState>,
@@ -177,6 +186,8 @@ async fn generate(
     let mut rng = rand::thread_rng();
     let data_byte: [u8; 21] = rng.gen();
     let base32_string = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &data_byte);
+    #[cfg(test)]
+    let base32_string = TSTRAND.to_string();
 
     let totp = TOTP::new(
         Algorithm::SHA1,
@@ -185,13 +196,13 @@ async fn generate(
         30,
         Secret::Encoded(base32_string).to_bytes().unwrap(),
         Some(ISSUER.to_string()),
-        "crmep".to_string(),
+        "CRmep".to_string(),
     )
     .unwrap();
 
     let otp_base32 = totp.get_secret_base32();
     let email = gen.email.to_owned();
-    let issuer = "CrMep";
+    let issuer = "CRmep";
     let otp_auth_url =
         format!("otpauth://totp/{issuer}:{email}?secret={otp_base32}&issuer={issuer}");
 

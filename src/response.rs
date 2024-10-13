@@ -37,6 +37,6 @@ pub struct UserResponse {
 #[derive(Serialize, Debug)]
 #[cfg_attr(test, derive(Deserialize))]
 pub struct GenerateResponse {
-    base32: String,
+    pub base32: String,
     otpauth_url: String,
 }
