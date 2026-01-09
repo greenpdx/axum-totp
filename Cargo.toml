@@ -3,6 +3,14 @@ name = "axum-topo"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "axum_topo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "axum-topo"
+path = "src/main.rs"
+
 [dependencies]
 axum = { version = "0.7.7", features = ["http2", "macros", "ws"] }
 base32 = "0.5.1"

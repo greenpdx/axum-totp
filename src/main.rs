@@ -2,11 +2,8 @@
 use axum::Router;
 use axum::http::Method;
 use std::time::Duration;
-mod services;
-mod models;
-mod response;
 
-use crate::{
+use axum_topo::{
     models::AppState,
     services::auth_routes,
 };
