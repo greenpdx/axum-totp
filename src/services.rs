@@ -11,47 +11,100 @@
 
 use crate::{
     models::{
-        AppState, DisableOTPSchema, GenerateOTPSchema, User, UserLoginSchema, UserRegisterSchema,
-        VerifyOTPSchema,
+        AppState, User, UserLoginSchema, UserRegisterSchema,
+        SessionSchema, OTPTokenSchema,
+        is_valid_email, validate_name, validate_password,
     },
-    response::{GenericResponse, UserData, UserResponse},
+    response::{GenericResponse, UserData},
 };
 use base32;
+use bcrypt::{hash, verify as bcrypt_verify, DEFAULT_COST};
 use chrono::prelude::*;
 use rand::Rng;
 use totp_rs::{Algorithm, Secret, TOTP};
 use uuid::Uuid;
 use axum::{
-    extract::{State, Json}, 
+    extract::{State, Json},
     Router, routing::post,
-    response::IntoResponse,
 };
 use serde_json::json;
+use axum::http::StatusCode;
 
 const ISSUER: &str = "CRmep";
+// Generic auth error to prevent user enumeration
+const AUTH_ERROR: &str = "Invalid credentials";
+const SESSION_ERROR: &str = "Invalid or expired session";
+
+type ApiResponse = (StatusCode, Json<serde_json::Value>);
+
+fn error_response(message: &str) -> ApiResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!(GenericResponse {
+            status: "fail".to_string(),
+            message: message.to_string(),
+        }))
+    )
+}
+
+fn unauthorized_response() -> ApiResponse {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!(GenericResponse {
+            status: "fail".to_string(),
+            message: SESSION_ERROR.to_string(),
+        }))
+    )
+}
+
+fn success_response(data: serde_json::Value) -> ApiResponse {
+    (StatusCode::OK, Json(data))
+}
+
+fn rate_limit_response() -> ApiResponse {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!(GenericResponse {
+            status: "fail".to_string(),
+            message: "Too many requests. Please try again later.".to_string(),
+        }))
+    )
+}
+
+fn create_totp(secret_base32: &str) -> Result<TOTP, String> {
+    let secret_bytes = Secret::Encoded(secret_base32.to_string())
+        .to_bytes()
+        .map_err(|e| format!("Invalid secret: {}", e))?;
+
+    TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some(ISSUER.to_string()),
+        "crmep".to_string(),
+    )
+    .map_err(|e| format!("Failed to create TOTP: {}", e))
+}
 
 fn otp_routes(state: AppState) -> Router {
-    let r = Router::new()
+    Router::new()
         .route("/generate", post(generate))
         .route("/verify", post(verify))
         .route("/validate", post(validate))
         .route("/disable", post(disable))
-        .with_state(state);
-
-    r
+        .with_state(state)
 }
 
 pub fn auth_routes(state: AppState) -> Router {
-    let r = Router::new()
-    .route("/register", post(register))
-    .route("/login", post(login))
-    .route("/profile", post(profile))
-    .route("/logout", post(logout))
-    .with_state(state.clone())
-    .nest("/otp", otp_routes(state));
-
-
-    r
+    Router::new()
+        .route("/register", post(register))
+        .route("/login", post(login))
+        .route("/profile", post(profile))
+        .route("/logout", post(logout))
+        .with_state(state.clone())
+        .nest("/otp", otp_routes(state))
 }
 
 
@@ -59,33 +112,46 @@ pub fn auth_routes(state: AppState) -> Router {
 async fn register(
     State(state): State<AppState>,
     Json(reg): Json<UserRegisterSchema>
+) -> ApiResponse {
+    // Input validation
+    if !is_valid_email(&reg.email) {
+        return error_response("Invalid email format");
+    }
+    if let Err(e) = validate_name(&reg.name) {
+        return error_response(e);
+    }
+    if let Err(e) = validate_password(&reg.password) {
+        return error_response(e);
+    }
 
-) -> impl IntoResponse {
-    let mut usr = state.db.lock().unwrap();
+    // Rate limit by email
+    if !state.auth_limiter.check(&reg.email.to_lowercase()) {
+        return rate_limit_response();
+    }
 
-    match usr
-        .iter()
-        .find(|&u| u.email == reg.email.to_lowercase()) {
-        Some(u) => {
-            println!("Found {:?}", u);
-            let error_response = GenericResponse {
-                status: "fail".to_string(),
-                message: format!("User with email: {} already exists", u.email),
-            };
-            //return (StatusCode::NOT_FOUND, format!("User with email: {} already exists", error_response.message))
-            return Json(json!(error_response))
-        },
-        None => ()
+    let mut usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
     };
+
+    // Don't reveal if email exists - use generic message
+    if usr.iter().any(|u| u.email == reg.email.to_lowercase()) {
+        return error_response(AUTH_ERROR);
+    }
 
     let uuid_id = Uuid::new_v4();
     let datetime = Utc::now();
-    println!("{:?}", reg);
+
+    let password_hash = match hash(&reg.password, DEFAULT_COST) {
+        Ok(h) => h,
+        Err(_) => return error_response("Registration failed"),
+    };
+
     let user = User {
         id: Some(uuid_id.to_string()),
-        email: reg.email.to_owned().to_lowercase(),
-        name: reg.name.to_owned(),
-        password: reg.password.to_owned(),
+        email: reg.email.to_lowercase(),
+        name: reg.name.clone(),
+        password: password_hash,
         otp_enabled: false,
         otp_verified: false,
         otp_base32: None,
@@ -96,327 +162,326 @@ async fn register(
         sess: None,
     };
 
-    println!("REG {:?} S=>{:?}",reg, user);
     usr.push(user);
-
-    Json(json!({"data": 42}))
-
-
+    success_response(json!({"status": "success", "message": "User registered"}))
 }
 
 #[axum::debug_handler]
 async fn login(
     State(state): State<AppState>,
-    Json(reg): Json<UserLoginSchema>
-) -> impl IntoResponse {
-    let mut usr = state.db.lock().unwrap();
+    Json(req): Json<UserLoginSchema>
+) -> ApiResponse {
+    // Input validation
+    if !is_valid_email(&req.email) {
+        return error_response(AUTH_ERROR);
+    }
+
+    // Rate limit by email
+    if !state.auth_limiter.check(&req.email.to_lowercase()) {
+        return rate_limit_response();
+    }
+
+    let mut usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
+    };
 
     let user = match usr
         .iter_mut()
-        .find(|u| u.email == reg.email.to_lowercase()) {
+        .find(|u| u.email == req.email.to_lowercase()) {
             Some(u) => {
-                // check password
+                // Use constant-time comparison via bcrypt
+                let valid = bcrypt_verify(&req.password, &u.password).unwrap_or(false);
+                if !valid {
+                    return error_response(AUTH_ERROR);
+                }
                 u
             }
             None => {
-                println!("Not Found");
-                let error_response = GenericResponse {
-                    status: "fail".to_string(),
-                    message: format!("Invalid email or password"),
-                };
-                //return (StatusCode::NOT_FOUND, format!("User with email: {} already exists", error_response.message))
-                return Json(json!(error_response))
+                // Same error message to prevent enumeration
+                return error_response(AUTH_ERROR);
             }
-    };  
+    };
 
     user.otp_verified = false;
 
-    let json_response = UserResponse {
-        status: "success".to_string(),
-        user: user_to_response(&user),
-    };
-    println!("LOGIN {:?}",&user);
-    Json(json!(json_response))
+    // Create session token
+    let user_id = user.id.clone().unwrap_or_default();
+    drop(usr); // Release lock before creating session
 
+    let session_token = match state.create_session(&user_id) {
+        Some(token) => token,
+        None => return error_response("Failed to create session"),
+    };
+
+    success_response(json!({
+        "status": "success",
+        "session_token": session_token,
+        "otp_enabled": state.db.lock().ok()
+            .and_then(|db| db.iter().find(|u| u.id == Some(user_id.clone())).map(|u| u.otp_enabled))
+            .unwrap_or(false)
+    }))
 }
 
 
 #[axum::debug_handler]
 async fn generate(
     State(state): State<AppState>,
-    Json(gen): Json<GenerateOTPSchema>
-) -> impl IntoResponse
-{
-    let mut usr = state.db.lock().unwrap();
+    Json(req): Json<SessionSchema>
+) -> ApiResponse {
+    // Validate session and get user_id
+    let user_id = match state.get_user_id_from_session(&req.session_token) {
+        Some(id) => id,
+        None => return unauthorized_response(),
+    };
 
-    let user = match usr
-        .iter_mut()
-        .find(|u| u.email == gen.email.to_lowercase()) {
-            Some(u) => {
-                if u.otp_enabled {
-                    println!("Already enabled");
-                    let error_response = GenericResponse {
-                        status: "fail".to_string(),
-                        message: format!("F2A already enabled"),
-                    };
-                    return Json(json!(error_response))
-                };
-                u
+    // Rate limit by session token
+    if !state.otp_limiter.check(&req.session_token) {
+        return rate_limit_response();
+    }
+
+    let mut usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
+    };
+
+    let user = match usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
+        Some(u) => {
+            if u.otp_enabled {
+                return error_response("2FA already enabled");
             }
-            None => {
-                println!("Not Found");
-                let error_response = GenericResponse {
-                    status: "fail".to_string(),
-                    message: format!("User Not Found"),
-                };
-                return Json(json!(error_response))
-            }
+            u
+        }
+        None => return unauthorized_response(),
     };
 
     let mut rng = rand::thread_rng();
     let data_byte: [u8; 21] = rng.gen();
     let base32_string = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &data_byte);
 
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        Secret::Encoded(base32_string).to_bytes().unwrap(),
-        Some(ISSUER.to_string()),
-        "crmep".to_string(),
-    )
-    .unwrap();
+    let totp = match create_totp(&base32_string) {
+        Ok(t) => t,
+        Err(e) => return error_response(&e),
+    };
 
     let otp_base32 = totp.get_secret_base32();
-    let email = gen.email.to_owned();
+    let email = user.email.clone();
     let issuer = "CrMep";
-    let otp_auth_url =
-        format!("otpauth://totp/{issuer}:{email}?secret={otp_base32}&issuer={issuer}");
+    let otp_auth_url = format!("otpauth://totp/{issuer}:{email}?secret={otp_base32}&issuer={issuer}");
 
-    // let otp_auth_url = format!("otpauth://totp/<issuer>:<account_name>?secret=<secret>&issuer=<issuer>");
-    user.otp_base32 = Some(otp_base32.to_owned());
-    user.otp_auth_url = Some(otp_auth_url.to_owned());
+    user.otp_base32 = Some(otp_base32.clone());
+    user.otp_auth_url = Some(otp_auth_url.clone());
     user.otp_enabled = true;
     user.otp_verified = false;
 
-    println!("GEN {:?}", &user);
-    Json(json!({"base32":otp_base32.to_owned(), "otpauth_url": otp_auth_url.to_owned()} ))
-
+    success_response(json!({"base32": otp_base32, "otpauth_url": otp_auth_url}))
 }
 
 #[axum::debug_handler]
 async fn verify(
     State(state): State<AppState>,
-    Json(verf): Json<VerifyOTPSchema>
-) -> impl IntoResponse {
-    let mut usr = state.db.lock().unwrap();
-
-    let user = match usr
-        .iter_mut()
-        .find(|u| u.id == Some(verf.user_id.clone())) {
-            Some(u) => {
-                let datetime = Utc::now();
-                u.updatedAt = Some(datetime);
-                u
-            }
-            None => {
-                println!("Not Found");
-                let error_response = GenericResponse {
-                    status: "fail".to_string(),
-                    message: format!("Invalid email or password"),
-                };
-                //return (StatusCode::NOT_FOUND, format!("User with email: {} already exists", error_response.message))
-                return Json(json!(error_response))
-            }
+    Json(req): Json<OTPTokenSchema>
+) -> ApiResponse {
+    // Validate session
+    let user_id = match state.get_user_id_from_session(&req.session_token) {
+        Some(id) => id,
+        None => return unauthorized_response(),
     };
-    println!("VERIFY {:?}", &user);
 
-    let otp_base32 = user.otp_base32.to_owned().unwrap();
+    // Rate limit by session token (strict)
+    if !state.otp_limiter.check(&req.session_token) {
+        return rate_limit_response();
+    }
 
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        Secret::Encoded(otp_base32).to_bytes().unwrap(),
-        Some(ISSUER.to_string()),
-        "crmep".to_string()
-    )
-    .unwrap();
+    let mut usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
+    };
 
-    let is_valid = totp.check_current(&verf.token).unwrap();
-    //println!("{:?} {:?}", otp_base32.clone(), totp, );
+    let user = match usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
+        Some(u) => {
+            u.updatedAt = Some(Utc::now());
+            u
+        }
+        None => return unauthorized_response(),
+    };
+
+    let otp_base32 = match &user.otp_base32 {
+        Some(s) => s.clone(),
+        None => return error_response("OTP not configured"),
+    };
+
+    let totp = match create_totp(&otp_base32) {
+        Ok(t) => t,
+        Err(e) => return error_response(&e),
+    };
+
+    let is_valid = totp.check_current(&req.otp_token).unwrap_or(false);
     if !is_valid {
-        let json_error = GenericResponse {
-            status: "fail".to_string(),
-            message: "Token is invalid or user doesn't exist".to_string(),
-        };
-
-        return Json(json!(json_error))
+        return error_response("Invalid OTP token");
     }
 
     user.otp_enabled = true;
     user.otp_verified = true;
-    println!("VERVAL");
-    Json(json!({"otp_verified": true, "user": user_to_response(user)}))
-
+    success_response(json!({"otp_verified": true}))
 }
 
 #[axum::debug_handler]
 async fn validate(
     State(state): State<AppState>,
-    Json(verf): Json<VerifyOTPSchema>
-) -> impl IntoResponse {
-    let usr = state.db.lock().unwrap();
+    Json(req): Json<OTPTokenSchema>
+) -> ApiResponse {
+    // Validate session
+    let user_id = match state.get_user_id_from_session(&req.session_token) {
+        Some(id) => id,
+        None => return unauthorized_response(),
+    };
 
-    let user = match usr
-        .iter()
-        .find(|u| u.id == Some(verf.user_id.clone())) {
-            Some(u) => {
-                u
-            }
-            None => {
-                println!("Not Found");
-                let error_response = GenericResponse {
-                    status: "fail".to_string(),
-                    message: format!("Invalid email or password"),
-                };
-                //return (StatusCode::NOT_FOUND, format!("User with email: {} already exists", error_response.message))
-                return Json(json!(error_response))
-            }
+    // Rate limit by session token (strict)
+    if !state.otp_limiter.check(&req.session_token) {
+        return rate_limit_response();
+    }
+
+    let usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
+    };
+
+    let user = match usr.iter().find(|u| u.id == Some(user_id.clone())) {
+        Some(u) => u,
+        None => return unauthorized_response(),
     };
 
     if !user.otp_enabled {
-        let json_error = GenericResponse {
-            status: "fail".to_string(),
-            message: "2FA not enabled".to_string(),
-        };
-
-        return Json(json!(json_error))
+        return error_response("2FA not enabled");
     }
 
-    let otp_base32 = user.otp_base32.to_owned().unwrap();
+    let otp_base32 = match &user.otp_base32 {
+        Some(s) => s.clone(),
+        None => return error_response("OTP not configured"),
+    };
 
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        Secret::Encoded(otp_base32).to_bytes().unwrap(),
-        Some(ISSUER.to_string()),
-        "crmep".to_string(),
-    )
-    .unwrap();
-    println!("{:?}",totp);
-    let is_valid = totp.check_current(&verf.token).unwrap();
-    println!("{:?}",is_valid);
+    let totp = match create_totp(&otp_base32) {
+        Ok(t) => t,
+        Err(e) => return error_response(&e),
+    };
+
+    let is_valid = totp.check_current(&req.otp_token).unwrap_or(false);
     if !is_valid {
-        return Json(json!(json!({"status": "fail", "message": "Token is invalid or user doesn't exist"})))
+        return error_response("Invalid OTP token");
     }
 
-    Json(json!({"otp_valid": true}))
-
+    success_response(json!({"otp_valid": true}))
 }
 
 #[axum::debug_handler]
 async fn disable(
     State(state): State<AppState>,
-    Json(dis): Json<DisableOTPSchema>
-)  -> impl IntoResponse {
-    let mut usr = state.db.lock().unwrap();
-
-    let user = match usr
-        .iter_mut()
-        .find(|u| u.id == Some(dis.user_id.clone())) {
-            Some(u) => {
-                u
-            }
-            None => {
-                println!("Not Found");
-                let error_response = GenericResponse {
-                    status: "fail".to_string(),
-                    message: format!("Invalid email or password"),
-                };
-                //return (StatusCode::NOT_FOUND, format!("User with email: {} already exists", error_response.message))
-                return Json(json!(error_response))
-            }
+    Json(req): Json<SessionSchema>
+) -> ApiResponse {
+    // Validate session
+    let user_id = match state.get_user_id_from_session(&req.session_token) {
+        Some(id) => id,
+        None => return unauthorized_response(),
     };
-    println!("DISABLED");
+
+    // Rate limit by session token
+    if !state.otp_limiter.check(&req.session_token) {
+        return rate_limit_response();
+    }
+
+    let mut usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
+    };
+
+    let user = match usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
+        Some(u) => u,
+        None => return unauthorized_response(),
+    };
+
     user.otp_enabled = false;
     user.otp_verified = false;
     user.otp_auth_url = None;
     user.otp_base32 = None;
-    
-    Json(json!({"user": user_to_response(user), "otp_disabled": true}))
+
+    success_response(json!({"otp_disabled": true}))
 }
 
 #[axum::debug_handler]
 async fn profile(
     State(state): State<AppState>,
-    Json(dis): Json<DisableOTPSchema>
-)  -> impl IntoResponse {
-    let usr = state.db.lock().unwrap();
-
-    let user = match usr
-        .iter()
-        .find(|u| u.id == Some(dis.user_id.clone())) {
-            Some(u) => {
-                u
-            }
-            None => {
-                println!("Not Found");
-                let error_response = GenericResponse {
-                    status: "fail".to_string(),
-                    message: format!("Invalid Id"),
-                };
-                return Json(json!(error_response))
-            }
+    Json(req): Json<SessionSchema>
+) -> ApiResponse {
+    // Validate session
+    let user_id = match state.get_user_id_from_session(&req.session_token) {
+        Some(id) => id,
+        None => return unauthorized_response(),
     };
-    println!("PROFILE {:?}", user);
-    Json(json!({"user": user_to_response(user)}))
+
+    // Rate limit by session token
+    if !state.auth_limiter.check(&req.session_token) {
+        return rate_limit_response();
+    }
+
+    let usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
+    };
+
+    let user = match usr.iter().find(|u| u.id == Some(user_id.clone())) {
+        Some(u) => u,
+        None => return unauthorized_response(),
+    };
+
+    success_response(json!({"user": user_to_response(user)}))
 }
 
 #[axum::debug_handler]
 async fn logout(
     State(state): State<AppState>,
-    Json(dis): Json<DisableOTPSchema>
-)  -> impl IntoResponse {
-    let mut usr = state.db.lock().unwrap();
-
-    let user = match usr
-        .iter_mut()
-        .find(|u| u.id == Some(dis.user_id.clone())) {
-            Some(u) => {
-                u.sess = None;
-                u
-            }
-            None => {
-                println!("Not Found");
-                let error_response = GenericResponse {
-                    status: "fail".to_string(),
-                    message: format!("Invalid email or password"),
-                };
-                //return (StatusCode::NOT_FOUND, format!("User with email: {} already exists", error_response.message))
-                return Json(json!(error_response))
-            }
+    Json(req): Json<SessionSchema>
+) -> ApiResponse {
+    // Validate and destroy session
+    let user_id = match state.get_user_id_from_session(&req.session_token) {
+        Some(id) => id,
+        None => return unauthorized_response(),
     };
-    Json(json!({"otp_verified": true, "user": user_to_response(user)}))
+
+    // Rate limit by session token
+    if !state.auth_limiter.check(&req.session_token) {
+        return rate_limit_response();
+    }
+
+    // Destroy the session
+    state.destroy_session(&req.session_token);
+
+    let mut usr = match state.db.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response("Internal server error"),
+    };
+
+    // Clear user session field if exists
+    if let Some(user) = usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
+        user.sess = None;
+    }
+
+    success_response(json!({"logged_out": true}))
 }
 
 fn user_to_response(user: &User) -> UserData {
-    let ses = user.sess.clone().unwrap_or("".to_string());
     UserData {
-        id: user.id.to_owned().unwrap(),
-        name: user.name.to_owned(),
-        email: user.email.to_owned(),
-        otp_auth_url: user.otp_auth_url.to_owned(),
-        otp_base32: user.otp_base32.to_owned(),
+        id: user.id.clone().unwrap_or_default(),
+        name: user.name.clone(),
+        email: user.email.clone(),
+        // Don't expose OTP secrets in response
+        otp_auth_url: None,
+        otp_base32: None,
         otp_enabled: user.otp_enabled,
         otp_verified: user.otp_verified,
-        createdAt: user.createdAt.unwrap(),
-        updatedAt: user.updatedAt.unwrap(),
-        sess: ses,
+        createdAt: user.createdAt.unwrap_or_else(Utc::now),
+        updatedAt: user.updatedAt.unwrap_or_else(Utc::now),
+        sess: String::new(), // Don't expose session
     }
 }
 

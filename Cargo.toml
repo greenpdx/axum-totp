@@ -17,4 +17,5 @@ totp-rs = { version = "5.5.1", features = ["qr","otpauth"] }
 tower = { version = "0.5.1", features = ["full"] }
 tower-http = { version = "0.6.1", features = ["full"] }
 uuid = { version = "1.2.2", features = ["v4"] }
+bcrypt = "0.15"
 
