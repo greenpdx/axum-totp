@@ -255,8 +255,8 @@ async fn generate(
         None => return unauthorized_response(),
     };
 
-    let mut rng = rand::thread_rng();
-    let data_byte: [u8; 21] = rng.gen();
+    let mut rng = rand::rng();
+    let data_byte: [u8; 21] = rng.random();
     let base32_string = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &data_byte);
 
     let totp = match create_totp(&base32_string) {

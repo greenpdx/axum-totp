@@ -48,8 +48,8 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
 }
 
 pub fn generate_session_token() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; SESSION_TOKEN_LENGTH] = rng.gen();
+    let mut rng = rand::rng();
+    let bytes: [u8; SESSION_TOKEN_LENGTH] = rng.random();
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -235,4 +235,224 @@ pub struct SessionSchema {
 pub struct OTPTokenSchema {
     pub session_token: String,
     pub otp_token: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod email_validation {
+        use super::*;
+
+        #[test]
+        fn valid_email() {
+            assert!(is_valid_email("test@example.com"));
+            assert!(is_valid_email("user.name@domain.co.uk"));
+            assert!(is_valid_email("a@b.co"));
+        }
+
+        #[test]
+        fn invalid_email_no_at() {
+            assert!(!is_valid_email("testexample.com"));
+        }
+
+        #[test]
+        fn invalid_email_no_domain() {
+            assert!(!is_valid_email("test@"));
+        }
+
+        #[test]
+        fn invalid_email_no_local() {
+            assert!(!is_valid_email("@example.com"));
+        }
+
+        #[test]
+        fn invalid_email_no_dot_in_domain() {
+            assert!(!is_valid_email("test@example"));
+        }
+
+        #[test]
+        fn invalid_email_empty() {
+            assert!(!is_valid_email(""));
+        }
+
+        #[test]
+        fn invalid_email_too_long() {
+            let long_email = format!("{}@example.com", "a".repeat(300));
+            assert!(!is_valid_email(&long_email));
+        }
+
+        #[test]
+        fn invalid_email_multiple_at() {
+            assert!(!is_valid_email("test@@example.com"));
+            assert!(!is_valid_email("test@exam@ple.com"));
+        }
+    }
+
+    mod name_validation {
+        use super::*;
+
+        #[test]
+        fn valid_name() {
+            assert!(validate_name("John Doe").is_ok());
+            assert!(validate_name("A").is_ok());
+        }
+
+        #[test]
+        fn invalid_name_empty() {
+            assert!(validate_name("").is_err());
+        }
+
+        #[test]
+        fn invalid_name_too_long() {
+            let long_name = "a".repeat(MAX_NAME_LENGTH + 1);
+            assert!(validate_name(&long_name).is_err());
+        }
+    }
+
+    mod password_validation {
+        use super::*;
+
+        #[test]
+        fn valid_password() {
+            assert!(validate_password("password123").is_ok());
+            assert!(validate_password("12345678").is_ok());
+        }
+
+        #[test]
+        fn invalid_password_too_short() {
+            assert!(validate_password("1234567").is_err());
+            assert!(validate_password("").is_err());
+        }
+
+        #[test]
+        fn invalid_password_too_long() {
+            let long_password = "a".repeat(MAX_PASSWORD_LENGTH + 1);
+            assert!(validate_password(&long_password).is_err());
+        }
+    }
+
+    mod session_token {
+        use super::*;
+
+        #[test]
+        fn generates_correct_length() {
+            let token = generate_session_token();
+            // Each byte becomes 2 hex chars
+            assert_eq!(token.len(), SESSION_TOKEN_LENGTH * 2);
+        }
+
+        #[test]
+        fn generates_unique_tokens() {
+            let token1 = generate_session_token();
+            let token2 = generate_session_token();
+            assert_ne!(token1, token2);
+        }
+
+        #[test]
+        fn generates_hex_string() {
+            let token = generate_session_token();
+            assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    mod rate_limiter {
+        use super::*;
+        use std::thread;
+        use std::time::Duration;
+
+        #[test]
+        fn allows_requests_within_limit() {
+            let limiter = RateLimiter::new(5, 60);
+            for _ in 0..5 {
+                assert!(limiter.check("test_key"));
+            }
+        }
+
+        #[test]
+        fn blocks_requests_over_limit() {
+            let limiter = RateLimiter::new(3, 60);
+            assert!(limiter.check("test_key"));
+            assert!(limiter.check("test_key"));
+            assert!(limiter.check("test_key"));
+            assert!(!limiter.check("test_key"));
+        }
+
+        #[test]
+        fn different_keys_have_separate_limits() {
+            let limiter = RateLimiter::new(2, 60);
+            assert!(limiter.check("key1"));
+            assert!(limiter.check("key1"));
+            assert!(!limiter.check("key1"));
+
+            assert!(limiter.check("key2"));
+            assert!(limiter.check("key2"));
+        }
+
+        #[test]
+        fn resets_after_window_expires() {
+            let limiter = RateLimiter::new(2, 1); // 1 second window
+            assert!(limiter.check("test_key"));
+            assert!(limiter.check("test_key"));
+            assert!(!limiter.check("test_key"));
+
+            thread::sleep(Duration::from_secs(2));
+            assert!(limiter.check("test_key"));
+        }
+    }
+
+    mod session_management {
+        use super::*;
+
+        #[test]
+        fn session_creation() {
+            let session = Session::new("user123".to_string());
+            assert_eq!(session.user_id, "user123");
+            assert!(!session.is_expired());
+        }
+
+        #[test]
+        fn session_touch_updates_activity() {
+            let mut session = Session::new("user123".to_string());
+            let initial_activity = session.last_activity;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            session.touch();
+            assert!(session.last_activity > initial_activity);
+        }
+    }
+
+    mod app_state {
+        use super::*;
+
+        #[test]
+        fn creates_and_validates_session() {
+            let state = AppState::init();
+            let token = state.create_session("user123").unwrap();
+
+            let user_id = state.get_user_id_from_session(&token);
+            assert_eq!(user_id, Some("user123".to_string()));
+        }
+
+        #[test]
+        fn invalid_session_returns_none() {
+            let state = AppState::init();
+            let user_id = state.get_user_id_from_session("invalid_token");
+            assert!(user_id.is_none());
+        }
+
+        #[test]
+        fn destroys_session() {
+            let state = AppState::init();
+            let token = state.create_session("user123").unwrap();
+
+            assert!(state.destroy_session(&token));
+            assert!(state.get_user_id_from_session(&token).is_none());
+        }
+
+        #[test]
+        fn destroy_nonexistent_session_returns_false() {
+            let state = AppState::init();
+            assert!(!state.destroy_session("nonexistent"));
+        }
+    }
 }
