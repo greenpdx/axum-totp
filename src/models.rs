@@ -1,6 +1,6 @@
-
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, SqlitePool};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -13,6 +13,11 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 pub const MAX_PASSWORD_LENGTH: usize = 128;
 pub const SESSION_TOKEN_LENGTH: usize = 32;
 pub const SESSION_TIMEOUT_SECS: u64 = 3600; // 1 hour
+
+// Role bitmask constants for axum-acl (u32)
+pub const ROLE_GUEST: u32 = 0;       // Unauthenticated
+pub const ROLE_USER: u32 = 1;        // Authenticated user
+pub const ROLE_ADMIN: u32 = 2;       // Admin privileges
 
 // Simple email validation (checks for @ and .)
 pub fn is_valid_email(email: &str) -> bool {
@@ -53,24 +58,27 @@ pub fn generate_session_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-#[allow(non_snake_case)]
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, FromRow)]
 pub struct User {
-    pub id: Option<String>,
+    pub id: String,
     pub email: String,
     pub name: String,
     pub password: String,
-
     pub otp_enabled: bool,
     pub otp_verified: bool,
     pub otp_base32: Option<String>,
     pub otp_auth_url: Option<String>,
+    pub role: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
 
-    pub createdAt: Option<DateTime<Utc>>,
-    pub updatedAt: Option<DateTime<Utc>>,
-
-    pub sess: Option<String>,
-    pub role: u64,
+#[derive(Debug, Clone, FromRow)]
+pub struct DbSession {
+    pub token: String,
+    pub user_id: String,
+    pub created_at: String,
+    pub last_activity: String,
 }
 
 #[derive(Clone, Debug)]
@@ -122,94 +130,101 @@ impl RateLimiter {
     }
 }
 
-// Session with expiration
-#[derive(Clone, Debug)]
-pub struct Session {
-    pub user_id: String,
-    pub created_at: Instant,
-    pub last_activity: Instant,
-}
-
-impl Session {
-    pub fn new(user_id: String) -> Self {
-        let now = Instant::now();
-        Self {
-            user_id,
-            created_at: now,
-            last_activity: now,
-        }
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.last_activity.elapsed().as_secs() >= SESSION_TIMEOUT_SECS
-    }
-
-    pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
-    }
-}
-
-// Maps session token -> Session
-pub type SessionStore = Arc<Mutex<HashMap<String, Session>>>;
-
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Arc<Mutex<Vec<User>>>,
-    pub sessions: SessionStore,
+    pub db: SqlitePool,
     pub auth_limiter: RateLimiter,
     pub otp_limiter: RateLimiter,
 }
 
 impl AppState {
-    pub fn init() -> AppState {
-        AppState {
-            db: Arc::new(Mutex::new(Vec::new())),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+    pub async fn init(database_url: &str) -> Result<AppState, sqlx::Error> {
+        let pool = SqlitePool::connect(database_url).await?;
+
+        // Run migrations
+        sqlx::query(include_str!("../migrations/001_initial.sql"))
+            .execute(&pool)
+            .await?;
+
+        Ok(AppState {
+            db: pool,
             // Auth endpoints: 10 requests per 60 seconds
             auth_limiter: RateLimiter::new(10, 60),
             // OTP endpoints: 5 requests per 60 seconds (stricter to prevent brute force)
             otp_limiter: RateLimiter::new(5, 60),
-        }
+        })
     }
 
-    pub fn create_session(&self, user_id: &str) -> Option<String> {
+    pub async fn create_session(&self, user_id: &str) -> Result<String, sqlx::Error> {
         let token = generate_session_token();
-        let mut sessions = self.sessions.lock().ok()?;
-        sessions.insert(token.clone(), Session::new(user_id.to_string()));
-        Some(token)
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO sessions (token, user_id, created_at, last_activity) VALUES (?, ?, ?, ?)"
+        )
+        .bind(&token)
+        .bind(user_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.db)
+        .await?;
+
+        Ok(token)
     }
 
-    pub fn get_user_id_from_session(&self, token: &str) -> Option<String> {
-        let mut sessions = self.sessions.lock().ok()?;
+    /// Returns (user_id, role) if session is valid
+    pub async fn get_session(&self, token: &str) -> Result<Option<(String, i64)>, sqlx::Error> {
+        let result = sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT s.user_id, u.role
+            FROM sessions s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.token = ?
+              AND datetime(s.last_activity) > datetime('now', '-1 hour')
+            "#
+        )
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await?;
 
-        // Check if session exists and is not expired
-        if let Some(session) = sessions.get_mut(token) {
-            if session.is_expired() {
-                sessions.remove(token);
-                return None;
-            }
-            // Update last activity (sliding expiration)
-            session.touch();
-            return Some(session.user_id.clone());
+        if result.is_some() {
+            // Update last_activity (sliding expiration)
+            let now = Utc::now().to_rfc3339();
+            sqlx::query("UPDATE sessions SET last_activity = ? WHERE token = ?")
+                .bind(&now)
+                .bind(token)
+                .execute(&self.db)
+                .await?;
         }
-        None
+
+        Ok(result)
     }
 
-    pub fn destroy_session(&self, token: &str) -> bool {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(token).is_some()
-        } else {
-            false
-        }
+    pub async fn destroy_session(&self, token: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM sessions WHERE token = ?")
+            .bind(token)
+            .execute(&self.db)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
-    // Cleanup expired sessions (call periodically)
-    pub fn cleanup_expired_sessions(&self) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.retain(|_, session| !session.is_expired());
-        }
+    pub async fn cleanup_expired_sessions(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM sessions WHERE datetime(last_activity) < datetime('now', '-1 hour')"
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected())
     }
 }
+
+// User ID extracted from session by middleware
+#[derive(Clone, Debug)]
+pub struct UserId(pub String);
+
+// User role extracted from session by middleware
+#[derive(Clone, Debug)]
+pub struct UserRole(pub u32);
 
 #[derive(Debug, Deserialize)]
 pub struct UserRegisterSchema {
@@ -224,16 +239,9 @@ pub struct UserLoginSchema {
     pub password: String,
 }
 
-// Uses session token for authentication
-#[derive(Debug, Deserialize)]
-pub struct SessionSchema {
-    pub session_token: String,
-}
-
-// OTP operations require session + token
+// OTP operations require otp_token in body (session from header)
 #[derive(Debug, Deserialize)]
 pub struct OTPTokenSchema {
-    pub session_token: String,
     pub otp_token: String,
 }
 
@@ -398,61 +406,6 @@ mod tests {
 
             thread::sleep(Duration::from_secs(2));
             assert!(limiter.check("test_key"));
-        }
-    }
-
-    mod session_management {
-        use super::*;
-
-        #[test]
-        fn session_creation() {
-            let session = Session::new("user123".to_string());
-            assert_eq!(session.user_id, "user123");
-            assert!(!session.is_expired());
-        }
-
-        #[test]
-        fn session_touch_updates_activity() {
-            let mut session = Session::new("user123".to_string());
-            let initial_activity = session.last_activity;
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            session.touch();
-            assert!(session.last_activity > initial_activity);
-        }
-    }
-
-    mod app_state {
-        use super::*;
-
-        #[test]
-        fn creates_and_validates_session() {
-            let state = AppState::init();
-            let token = state.create_session("user123").unwrap();
-
-            let user_id = state.get_user_id_from_session(&token);
-            assert_eq!(user_id, Some("user123".to_string()));
-        }
-
-        #[test]
-        fn invalid_session_returns_none() {
-            let state = AppState::init();
-            let user_id = state.get_user_id_from_session("invalid_token");
-            assert!(user_id.is_none());
-        }
-
-        #[test]
-        fn destroys_session() {
-            let state = AppState::init();
-            let token = state.create_session("user123").unwrap();
-
-            assert!(state.destroy_session(&token));
-            assert!(state.get_user_id_from_session(&token).is_none());
-        }
-
-        #[test]
-        fn destroy_nonexistent_session_returns_false() {
-            let state = AppState::init();
-            assert!(!state.destroy_session("nonexistent"));
         }
     }
 }

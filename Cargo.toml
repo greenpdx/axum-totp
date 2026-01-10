@@ -1,32 +1,37 @@
 [package]
-name = "axum-topo"
+name = "axum-totp"
 version = "0.1.0"
 edition = "2024"
+description = "User authentication with TOTP two-factor authentication for Axum web applications"
+license = "LGPL-2.1"
+repository = "https://github.com/greenpdx/axum-totp"
+authors = ["greenpdx"]
+keywords = ["axum", "totp", "authentication", "2fa", "security"]
+categories = ["authentication", "web-programming"]
 
 [lib]
-name = "axum_topo"
+name = "axum_totp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "axum-topo"
+name = "axum-totp"
 path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["http2", "macros", "ws"] }
 base32 = "0.5"
+bcrypt = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 env_logger = "0.11"
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sqlx = { version = "0.8", features = ["postgres", "sqlite"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["full"] }
-totp-rs = { version = "5", features = ["qr","otpauth"] }
+totp-rs = { version = "5", features = ["qr", "otpauth"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
-bcrypt = "0.17"
-axum-acl = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

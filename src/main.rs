@@ -1,9 +1,10 @@
-
-use axum::Router;
+use axum::{middleware, Router};
 use axum::http::Method;
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum_topo::{
+use axum_totp::{
+    acl::auth_middleware,
     models::AppState,
     services::auth_routes,
 };
@@ -16,15 +17,27 @@ use tower_http::{
 // Cleanup interval for expired sessions (5 minutes)
 const SESSION_CLEANUP_INTERVAL_SECS: u64 = 300;
 
+// Database URL - defaults to local SQLite file
+const DATABASE_URL: &str = "sqlite:./data.db?mode=rwc";
+
 #[tokio::main]
 async fn main() {
-    let cors = CorsLayer::new()
-        // allow `GET` and `POST` when accessing the resource
-        .allow_methods([Method::GET, Method::POST])
-        // allow requests from any origin
-        .allow_origin(Any);
+    // Initialize logging
+    env_logger::init();
 
-    let state = AppState::init();
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_origin(Any)
+        .allow_headers(Any);
+
+    // Initialize database
+    let state = match AppState::init(DATABASE_URL).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to initialize database: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Spawn background task to cleanup expired sessions
     let cleanup_state = state.clone();
@@ -32,7 +45,9 @@ async fn main() {
         let mut interval = tokio::time::interval(Duration::from_secs(SESSION_CLEANUP_INTERVAL_SECS));
         loop {
             interval.tick().await;
-            cleanup_state.cleanup_expired_sessions();
+            if let Err(e) = cleanup_state.cleanup_expired_sessions().await {
+                eprintln!("Session cleanup error: {}", e);
+            }
         }
     });
 
@@ -46,23 +61,28 @@ async fn main() {
         }
     };
     println!("Server running on http://0.0.0.0:8000");
-    if let Err(e) = axum::serve(listener, app).await {
+
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>()
+    ).await {
         eprintln!("Server error: {}", e);
         std::process::exit(1);
     }
 }
 
 async fn init_router(state: AppState, _cors: CorsLayer) -> Router {
-    let auth = auth_routes(state);
+    let auth = auth_routes(state.clone());
 
     // Serve static files from the frontend dist folder
     let serve_dir = ServeDir::new("frontend/dist")
         .not_found_service(ServeFile::new("frontend/dist/index.html"));
 
     Router::new()
-    .nest("/auth", auth)
-    .fallback_service(serve_dir)
-    .layer(CorsLayer::permissive())
-    .layer(TraceLayer::new_for_http())
+        .nest("/auth", auth)
+        .fallback_service(serve_dir)
+        // Auth middleware extracts user ID and role from session token header
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
 }
-

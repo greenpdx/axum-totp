@@ -1,34 +1,21 @@
-/*
-/healthchecker
-/auth/register
-/auth/login
-/auth/otp/generate
-/auth/otp/verify
-/auth/otp/validate
-/auth/otp/disable
-
-*/
-
 use crate::{
     models::{
-        AppState, User, UserLoginSchema, UserRegisterSchema,
-        SessionSchema, OTPTokenSchema,
-        is_valid_email, validate_name, validate_password,
+        AppState, User, UserLoginSchema, UserRegisterSchema, OTPTokenSchema, UserId,
+        is_valid_email, validate_name, validate_password, ROLE_USER,
     },
     response::{GenericResponse, UserData},
+};
+use axum::{
+    extract::{Extension, State, Json},
+    Router, routing::post,
+    http::StatusCode,
 };
 use base32;
 use bcrypt::{hash, verify as bcrypt_verify, DEFAULT_COST};
 use chrono::prelude::*;
-use rand::Rng;
+use serde_json::json;
 use totp_rs::{Algorithm, Secret, TOTP};
 use uuid::Uuid;
-use axum::{
-    extract::{State, Json},
-    Router, routing::post,
-};
-use serde_json::json;
-use axum::http::StatusCode;
 
 const ISSUER: &str = "CRmep";
 // Generic auth error to prevent user enumeration
@@ -67,6 +54,16 @@ fn rate_limit_response() -> ApiResponse {
         Json(json!(GenericResponse {
             status: "fail".to_string(),
             message: "Too many requests. Please try again later.".to_string(),
+        }))
+    )
+}
+
+fn internal_error() -> ApiResponse {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!(GenericResponse {
+            status: "fail".to_string(),
+            message: "Internal server error".to_string(),
         }))
     )
 }
@@ -129,41 +126,47 @@ async fn register(
         return rate_limit_response();
     }
 
-    let mut usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
-    };
+    // Check if email exists
+    let existing = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE email = ?"
+    )
+    .bind(&reg.email.to_lowercase())
+    .fetch_one(&state.db)
+    .await;
 
-    // Don't reveal if email exists - use generic message
-    if usr.iter().any(|u| u.email == reg.email.to_lowercase()) {
-        return error_response(AUTH_ERROR);
+    match existing {
+        Ok(count) if count > 0 => return error_response(AUTH_ERROR),
+        Err(_) => return internal_error(),
+        _ => {}
     }
 
-    let uuid_id = Uuid::new_v4();
-    let datetime = Utc::now();
+    let uuid_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
 
     let password_hash = match hash(&reg.password, DEFAULT_COST) {
         Ok(h) => h,
         Err(_) => return error_response("Registration failed"),
     };
 
-    let user = User {
-        id: Some(uuid_id.to_string()),
-        email: reg.email.to_lowercase(),
-        name: reg.name.clone(),
-        password: password_hash,
-        otp_enabled: false,
-        otp_verified: false,
-        otp_base32: None,
-        otp_auth_url: None,
-        createdAt: Some(datetime),
-        updatedAt: Some(datetime),
-        role: 0,
-        sess: None,
-    };
+    let result = sqlx::query(
+        r#"INSERT INTO users
+           (id, email, name, password, otp_enabled, otp_verified, role, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)"#
+    )
+    .bind(&uuid_id)
+    .bind(&reg.email.to_lowercase())
+    .bind(&reg.name)
+    .bind(&password_hash)
+    .bind(ROLE_USER as i64)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await;
 
-    usr.push(user);
-    success_response(json!({"status": "success", "message": "User registered"}))
+    match result {
+        Ok(_) => success_response(json!({"status": "success", "message": "User registered"})),
+        Err(_) => internal_error(),
+    }
 }
 
 #[axum::debug_handler]
@@ -181,82 +184,79 @@ async fn login(
         return rate_limit_response();
     }
 
-    let mut usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
+    // Find user
+    let user = sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE email = ?"
+    )
+    .bind(&req.email.to_lowercase())
+    .fetch_optional(&state.db)
+    .await;
+
+    let user = match user {
+        Ok(Some(u)) => u,
+        Ok(None) => return error_response(AUTH_ERROR),
+        Err(_) => return internal_error(),
     };
 
-    let user = match usr
-        .iter_mut()
-        .find(|u| u.email == req.email.to_lowercase()) {
-            Some(u) => {
-                // Use constant-time comparison via bcrypt
-                let valid = bcrypt_verify(&req.password, &u.password).unwrap_or(false);
-                if !valid {
-                    return error_response(AUTH_ERROR);
-                }
-                u
-            }
-            None => {
-                // Same error message to prevent enumeration
-                return error_response(AUTH_ERROR);
-            }
-    };
+    // Verify password
+    let valid = bcrypt_verify(&req.password, &user.password).unwrap_or(false);
+    if !valid {
+        return error_response(AUTH_ERROR);
+    }
 
-    user.otp_verified = false;
+    // Reset otp_verified on login
+    let _ = sqlx::query("UPDATE users SET otp_verified = 0 WHERE id = ?")
+        .bind(&user.id)
+        .execute(&state.db)
+        .await;
 
     // Create session token
-    let user_id = user.id.clone().unwrap_or_default();
-    drop(usr); // Release lock before creating session
-
-    let session_token = match state.create_session(&user_id) {
-        Some(token) => token,
-        None => return error_response("Failed to create session"),
+    let session_token = match state.create_session(&user.id).await {
+        Ok(token) => token,
+        Err(_) => return error_response("Failed to create session"),
     };
 
     success_response(json!({
         "status": "success",
         "session_token": session_token,
-        "otp_enabled": state.db.lock().ok()
-            .and_then(|db| db.iter().find(|u| u.id == Some(user_id.clone())).map(|u| u.otp_enabled))
-            .unwrap_or(false)
+        "otp_enabled": user.otp_enabled
     }))
 }
-
 
 #[axum::debug_handler]
 async fn generate(
     State(state): State<AppState>,
-    Json(req): Json<SessionSchema>
+    user_id: Option<Extension<UserId>>,
 ) -> ApiResponse {
-    // Validate session and get user_id
-    let user_id = match state.get_user_id_from_session(&req.session_token) {
-        Some(id) => id,
+    // Check authentication
+    let user_id = match user_id {
+        Some(Extension(id)) => id,
         None => return unauthorized_response(),
     };
 
-    // Rate limit by session token
-    if !state.otp_limiter.check(&req.session_token) {
+    // Rate limit by user_id
+    if !state.otp_limiter.check(&user_id.0) {
         return rate_limit_response();
     }
 
-    let mut usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
+    // Get user
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id.0)
+        .fetch_optional(&state.db)
+        .await;
+
+    let user = match user {
+        Ok(Some(u)) => u,
+        Ok(None) => return unauthorized_response(),
+        Err(_) => return internal_error(),
     };
 
-    let user = match usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
-        Some(u) => {
-            if u.otp_enabled {
-                return error_response("2FA already enabled");
-            }
-            u
-        }
-        None => return unauthorized_response(),
-    };
+    if user.otp_enabled {
+        return error_response("2FA already enabled");
+    }
 
-    let mut rng = rand::rng();
-    let data_byte: [u8; 21] = rng.random();
+    // Generate random bytes before any async operations (to avoid Send issues)
+    let data_byte: [u8; 21] = rand::random();
     let base32_string = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &data_byte);
 
     let totp = match create_totp(&base32_string) {
@@ -269,41 +269,49 @@ async fn generate(
     let issuer = "CrMep";
     let otp_auth_url = format!("otpauth://totp/{issuer}:{email}?secret={otp_base32}&issuer={issuer}");
 
-    user.otp_base32 = Some(otp_base32.clone());
-    user.otp_auth_url = Some(otp_auth_url.clone());
-    user.otp_enabled = true;
-    user.otp_verified = false;
+    // Update user
+    let result = sqlx::query(
+        "UPDATE users SET otp_base32 = ?, otp_auth_url = ?, otp_enabled = 1, otp_verified = 0 WHERE id = ?"
+    )
+    .bind(&otp_base32)
+    .bind(&otp_auth_url)
+    .bind(&user_id.0)
+    .execute(&state.db)
+    .await;
 
-    success_response(json!({"base32": otp_base32, "otpauth_url": otp_auth_url}))
+    match result {
+        Ok(_) => success_response(json!({"base32": otp_base32, "otpauth_url": otp_auth_url})),
+        Err(_) => internal_error(),
+    }
 }
 
 #[axum::debug_handler]
 async fn verify(
     State(state): State<AppState>,
+    user_id: Option<Extension<UserId>>,
     Json(req): Json<OTPTokenSchema>
 ) -> ApiResponse {
-    // Validate session
-    let user_id = match state.get_user_id_from_session(&req.session_token) {
-        Some(id) => id,
+    // Check authentication
+    let user_id = match user_id {
+        Some(Extension(id)) => id,
         None => return unauthorized_response(),
     };
 
-    // Rate limit by session token (strict)
-    if !state.otp_limiter.check(&req.session_token) {
+    // Rate limit by user_id (strict)
+    if !state.otp_limiter.check(&user_id.0) {
         return rate_limit_response();
     }
 
-    let mut usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
-    };
+    // Get user
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id.0)
+        .fetch_optional(&state.db)
+        .await;
 
-    let user = match usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
-        Some(u) => {
-            u.updatedAt = Some(Utc::now());
-            u
-        }
-        None => return unauthorized_response(),
+    let user = match user {
+        Ok(Some(u)) => u,
+        Ok(None) => return unauthorized_response(),
+        Err(_) => return internal_error(),
     };
 
     let otp_base32 = match &user.otp_base32 {
@@ -321,35 +329,49 @@ async fn verify(
         return error_response("Invalid OTP token");
     }
 
-    user.otp_enabled = true;
-    user.otp_verified = true;
-    success_response(json!({"otp_verified": true}))
+    // Update user
+    let now = Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE users SET otp_enabled = 1, otp_verified = 1, updated_at = ? WHERE id = ?"
+    )
+    .bind(&now)
+    .bind(&user_id.0)
+    .execute(&state.db)
+    .await;
+
+    match result {
+        Ok(_) => success_response(json!({"otp_verified": true})),
+        Err(_) => internal_error(),
+    }
 }
 
 #[axum::debug_handler]
 async fn validate(
     State(state): State<AppState>,
+    user_id: Option<Extension<UserId>>,
     Json(req): Json<OTPTokenSchema>
 ) -> ApiResponse {
-    // Validate session
-    let user_id = match state.get_user_id_from_session(&req.session_token) {
-        Some(id) => id,
+    // Check authentication
+    let user_id = match user_id {
+        Some(Extension(id)) => id,
         None => return unauthorized_response(),
     };
 
-    // Rate limit by session token (strict)
-    if !state.otp_limiter.check(&req.session_token) {
+    // Rate limit by user_id (strict)
+    if !state.otp_limiter.check(&user_id.0) {
         return rate_limit_response();
     }
 
-    let usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
-    };
+    // Get user
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id.0)
+        .fetch_optional(&state.db)
+        .await;
 
-    let user = match usr.iter().find(|u| u.id == Some(user_id.clone())) {
-        Some(u) => u,
-        None => return unauthorized_response(),
+    let user = match user {
+        Ok(Some(u)) => u,
+        Ok(None) => return unauthorized_response(),
+        Err(_) => return internal_error(),
     };
 
     if !user.otp_enabled {
@@ -377,93 +399,82 @@ async fn validate(
 #[axum::debug_handler]
 async fn disable(
     State(state): State<AppState>,
-    Json(req): Json<SessionSchema>
+    user_id: Option<Extension<UserId>>,
 ) -> ApiResponse {
-    // Validate session
-    let user_id = match state.get_user_id_from_session(&req.session_token) {
-        Some(id) => id,
+    // Check authentication
+    let user_id = match user_id {
+        Some(Extension(id)) => id,
         None => return unauthorized_response(),
     };
 
-    // Rate limit by session token
-    if !state.otp_limiter.check(&req.session_token) {
+    // Rate limit by user_id
+    if !state.otp_limiter.check(&user_id.0) {
         return rate_limit_response();
     }
 
-    let mut usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
-    };
+    // Update user
+    let result = sqlx::query(
+        "UPDATE users SET otp_enabled = 0, otp_verified = 0, otp_base32 = NULL, otp_auth_url = NULL WHERE id = ?"
+    )
+    .bind(&user_id.0)
+    .execute(&state.db)
+    .await;
 
-    let user = match usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
-        Some(u) => u,
-        None => return unauthorized_response(),
-    };
-
-    user.otp_enabled = false;
-    user.otp_verified = false;
-    user.otp_auth_url = None;
-    user.otp_base32 = None;
-
-    success_response(json!({"otp_disabled": true}))
+    match result {
+        Ok(_) => success_response(json!({"otp_disabled": true})),
+        Err(_) => internal_error(),
+    }
 }
 
 #[axum::debug_handler]
 async fn profile(
     State(state): State<AppState>,
-    Json(req): Json<SessionSchema>
+    user_id: Option<Extension<UserId>>,
 ) -> ApiResponse {
-    // Validate session
-    let user_id = match state.get_user_id_from_session(&req.session_token) {
-        Some(id) => id,
+    // Check authentication
+    let user_id = match user_id {
+        Some(Extension(id)) => id,
         None => return unauthorized_response(),
     };
 
-    // Rate limit by session token
-    if !state.auth_limiter.check(&req.session_token) {
+    // Rate limit by user_id
+    if !state.auth_limiter.check(&user_id.0) {
         return rate_limit_response();
     }
 
-    let usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
-    };
+    // Get user
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id.0)
+        .fetch_optional(&state.db)
+        .await;
 
-    let user = match usr.iter().find(|u| u.id == Some(user_id.clone())) {
-        Some(u) => u,
-        None => return unauthorized_response(),
-    };
-
-    success_response(json!({"user": user_to_response(user)}))
+    match user {
+        Ok(Some(u)) => success_response(json!({"user": user_to_response(&u)})),
+        Ok(None) => unauthorized_response(),
+        Err(_) => internal_error(),
+    }
 }
 
 #[axum::debug_handler]
 async fn logout(
     State(state): State<AppState>,
-    Json(req): Json<SessionSchema>
+    user_id: Option<Extension<UserId>>,
+    headers: axum::http::HeaderMap,
 ) -> ApiResponse {
-    // Validate and destroy session
-    let user_id = match state.get_user_id_from_session(&req.session_token) {
-        Some(id) => id,
+    // Check authentication
+    let user_id = match user_id {
+        Some(Extension(id)) => id,
         None => return unauthorized_response(),
     };
 
-    // Rate limit by session token
-    if !state.auth_limiter.check(&req.session_token) {
+    // Rate limit by user_id
+    if !state.auth_limiter.check(&user_id.0) {
         return rate_limit_response();
     }
 
-    // Destroy the session
-    state.destroy_session(&req.session_token);
-
-    let mut usr = match state.db.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response("Internal server error"),
-    };
-
-    // Clear user session field if exists
-    if let Some(user) = usr.iter_mut().find(|u| u.id == Some(user_id.clone())) {
-        user.sess = None;
+    // Get token from header and destroy session
+    if let Some(token) = headers.get("X-Session-Token").and_then(|v| v.to_str().ok()) {
+        let _ = state.destroy_session(token).await;
     }
 
     success_response(json!({"logged_out": true}))
@@ -471,30 +482,12 @@ async fn logout(
 
 fn user_to_response(user: &User) -> UserData {
     UserData {
-        id: user.id.clone().unwrap_or_default(),
+        id: user.id.clone(),
         name: user.name.clone(),
         email: user.email.clone(),
-        // Don't expose OTP secrets in response
-        otp_auth_url: None,
-        otp_base32: None,
         otp_enabled: user.otp_enabled,
         otp_verified: user.otp_verified,
-        createdAt: user.createdAt.unwrap_or_else(Utc::now),
-        updatedAt: user.updatedAt.unwrap_or_else(Utc::now),
-        sess: String::new(), // Don't expose session
+        created_at: user.created_at.clone(),
+        updated_at: user.updated_at.clone(),
     }
 }
-
-/*
-pub fn config(conf: &mut web::ServiceConfig) {
-    let scope = web::scope("/api")
-        .service(health_checker_handler)
-        .service(register_user_handler)
-        .service(login_user_handler)
-        .service(generate_otp_handler)
-        .service(verify_otp_handler)
-        .service(validate_otp_handler)
-        .service(disable_otp_handler);
-
-    conf.service(scope);
-}*/

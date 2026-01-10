@@ -1,6 +1,6 @@
 # axum-totp
 
-A Rust web server implementing user authentication with TOTP (Time-based One-Time Password) two-factor authentication, built with Axum.
+A Rust web server implementing user authentication with TOTP (Time-based One-Time Password) two-factor authentication, built with Axum and SQLite.
 
 ## Features
 
@@ -9,6 +9,8 @@ A Rust web server implementing user authentication with TOTP (Time-based One-Tim
 - TOTP 2FA (compatible with Google Authenticator, Authy, etc.)
 - Rate limiting to prevent brute force attacks
 - Input validation for emails, passwords, and names
+- SQLite database for persistent storage
+- Header-based session authentication
 
 ## Requirements
 
@@ -19,7 +21,7 @@ A Rust web server implementing user authentication with TOTP (Time-based One-Tim
 
 ```bash
 # Clone and build
-git clone <repository-url>
+git clone https://github.com/greenpdx/axum-totp
 cd axum-totp
 cargo build --release
 
@@ -27,27 +29,37 @@ cargo build --release
 cargo run --release
 ```
 
-The server starts at `http://0.0.0.0:8000`
+The server starts at `http://0.0.0.0:8000` and creates a `data.db` SQLite file for storage.
 
 ## API Endpoints
 
 ### Authentication
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/auth/register` | Register a new user |
-| POST | `/auth/login` | Login and get session token |
-| POST | `/auth/profile` | Get user profile (requires session) |
-| POST | `/auth/logout` | Logout and invalidate session |
+| Method | Endpoint | Description | Auth Required |
+|--------|----------|-------------|---------------|
+| POST | `/auth/register` | Register a new user | No |
+| POST | `/auth/login` | Login and get session token | No |
+| POST | `/auth/profile` | Get user profile | Yes |
+| POST | `/auth/logout` | Logout and invalidate session | Yes |
 
 ### Two-Factor Authentication (OTP)
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/auth/otp/generate` | Generate OTP secret and QR URL |
-| POST | `/auth/otp/verify` | Verify and enable 2FA |
-| POST | `/auth/otp/validate` | Validate OTP token |
-| POST | `/auth/otp/disable` | Disable 2FA |
+| Method | Endpoint | Description | Auth Required |
+|--------|----------|-------------|---------------|
+| POST | `/auth/otp/generate` | Generate OTP secret and QR URL | Yes |
+| POST | `/auth/otp/verify` | Verify and enable 2FA | Yes |
+| POST | `/auth/otp/validate` | Validate OTP token | Yes |
+| POST | `/auth/otp/disable` | Disable 2FA | Yes |
+
+## Authentication
+
+For authenticated endpoints, pass the session token in the `X-Session-Token` header:
+
+```bash
+curl -X POST http://localhost:8000/auth/profile \
+  -H "Content-Type: application/json" \
+  -H "X-Session-Token: your_session_token"
+```
 
 ## API Usage
 
@@ -81,7 +93,7 @@ Response:
 ```bash
 curl -X POST http://localhost:8000/auth/profile \
   -H "Content-Type: application/json" \
-  -d '{"session_token": "your_session_token"}'
+  -H "X-Session-Token: your_session_token"
 ```
 
 ### Generate OTP Secret
@@ -89,7 +101,7 @@ curl -X POST http://localhost:8000/auth/profile \
 ```bash
 curl -X POST http://localhost:8000/auth/otp/generate \
   -H "Content-Type: application/json" \
-  -d '{"session_token": "your_session_token"}'
+  -H "X-Session-Token: your_session_token"
 ```
 
 Response:
@@ -105,7 +117,8 @@ Response:
 ```bash
 curl -X POST http://localhost:8000/auth/otp/verify \
   -H "Content-Type: application/json" \
-  -d '{"session_token": "your_session_token", "otp_token": "123456"}'
+  -H "X-Session-Token: your_session_token" \
+  -d '{"otp_token": "123456"}'
 ```
 
 ### Validate OTP
@@ -113,7 +126,8 @@ curl -X POST http://localhost:8000/auth/otp/verify \
 ```bash
 curl -X POST http://localhost:8000/auth/otp/validate \
   -H "Content-Type: application/json" \
-  -d '{"session_token": "your_session_token", "otp_token": "123456"}'
+  -H "X-Session-Token: your_session_token" \
+  -d '{"otp_token": "123456"}'
 ```
 
 ### Disable OTP
@@ -121,7 +135,7 @@ curl -X POST http://localhost:8000/auth/otp/validate \
 ```bash
 curl -X POST http://localhost:8000/auth/otp/disable \
   -H "Content-Type: application/json" \
-  -d '{"session_token": "your_session_token"}'
+  -H "X-Session-Token: your_session_token"
 ```
 
 ### Logout
@@ -129,7 +143,7 @@ curl -X POST http://localhost:8000/auth/otp/disable \
 ```bash
 curl -X POST http://localhost:8000/auth/logout \
   -H "Content-Type: application/json" \
-  -d '{"session_token": "your_session_token"}'
+  -H "X-Session-Token: your_session_token"
 ```
 
 ## Security Features
@@ -140,6 +154,7 @@ curl -X POST http://localhost:8000/auth/logout \
   - Auth endpoints: 10 requests/minute per email
   - OTP endpoints: 5 requests/minute per session (stricter to prevent brute force)
 - **Input Validation**: Email format, password length (8-128 chars), name length
+- **Database**: SQLite with foreign key constraints
 
 ## Testing
 
@@ -157,9 +172,12 @@ cargo test -- --nocapture
 src/
 ├── main.rs      # Server setup and router configuration
 ├── lib.rs       # Library exports
+├── acl.rs       # Authentication middleware
 ├── models.rs    # Data models, validation, session management
 ├── services.rs  # API route handlers
 └── response.rs  # Response types
+migrations/
+└── 001_initial.sql  # Database schema
 tests/
 └── integration_tests.rs  # API integration tests
 ```
@@ -167,6 +185,7 @@ tests/
 ## Dependencies
 
 - **axum** 0.8 - Web framework
+- **sqlx** 0.8 - Async SQLite database
 - **tokio** - Async runtime
 - **bcrypt** - Password hashing
 - **totp-rs** - TOTP implementation
@@ -175,4 +194,4 @@ tests/
 
 ## License
 
-MIT
+LGPL-2.1
